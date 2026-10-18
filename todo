@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# todo: simple per-client task list (plain TSV, fast add/list/done)
+# Stored at ~/.timetrack/todos.tsv next to the time tracker.
+# Columns: id  client  status  priority  due  created  done_date  text
+set -euo pipefail
+
+TT_DIR="${TT_DIR:-$HOME/.timetrack}"
+DB="$TT_DIR/todos.tsv"
+mkdir -p "$TT_DIR"
+[ -f "$DB" ] || printf 'id\tclient\tstatus\tpriority\tdue\tcreated\tdone_date\ttext\n' > "$DB"
+
+today=$(date +%Y-%m-%d)
+plabel() { case "$1" in h) echo "!h";; l) echo "!l";; *) echo "!m";; esac; }
+
+cmd="${1:-list}"; shift || true
+
+case "$cmd" in
+  add)
+    client="${1:-}"
+    [ -n "$client" ] || { echo "Usage: todo add <client> <text> [!h|!m|!l] [@YYYY-MM-DD]" >&2; exit 1; }
+    shift || true
+    prio="m"; due=""; text=""
+    for w in "$@"; do
+      case "$w" in
+        '!h'|'!high') prio="h" ;;
+        '!m'|'!med')  prio="m" ;;
+        '!l'|'!low')  prio="l" ;;
+        @*)           due="${w#@}" ;;
+        *)            text="${text:+$text }$w" ;;
+      esac
+    done
+    text="${text//$'\t'/ }"
+    [ -n "$text" ] || { echo "Need some task text." >&2; exit 1; }
+    id=$(awk -F'\t' 'NR>1 && $1+0>m {m=$1} END{print m+1}' "$DB")
+    printf '%s\t%s\topen\t%s\t%s\t%s\t\t%s\n' "$id" "$client" "$prio" "$due" "$today" "$text" >> "$DB"
+    echo "➕ [$id] $client: $text $(plabel "$prio")${due:+ (due $due)}"
+    ;;
+  done|do)
+    id="${1:-}"; [ -n "$id" ] || { echo "Usage: todo done <id>" >&2; exit 1; }
+    awk -F'\t' -v id="$id" -v d="$today" 'BEGIN{OFS="\t"} NR==1{print;next} $1==id{$3="done";$7=d} {print}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+    echo "✅ Completed [$id]"
+    ;;
+  rm|del)
+    id="${1:-}"; [ -n "$id" ] || { echo "Usage: todo rm <id>" >&2; exit 1; }
+    awk -F'\t' -v id="$id" 'NR==1{print;next} $1!=id{print}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+    echo "🗑  Removed [$id]"
+    ;;
+  clear)
+    [ "${1:-}" = "done" ] || { echo "Usage: todo clear done" >&2; exit 1; }
+    awk -F'\t' 'NR==1{print;next} $3!="done"{print}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+    echo "🧹 Cleared completed tasks."
+    ;;
+  list|all)
+    showdone="no"; [ "$cmd" = "all" ] && showdone="yes"
+    cf="${1:-}"
+    awk -F'\t' -v today="$today" -v showdone="$showdone" -v cf="$cf" '
+      NR==1 { next }
+      {
+        id=$1; client=$2; status=$3; prio=$4; due=$5; text=$8
+        if (status=="done" && showdone=="no") next
+        if (cf!="" && tolower(client)!=tolower(cf)) next
+        pn = (prio=="h"?0:(prio=="m"?1:2))
+        pl = (prio=="h"?"!h":(prio=="m"?"!m":"!l"))
+        dkey = (due==""?"9999-99-99":due)
+        duestr = ""
+        if (due!="") duestr = (due<today ? ("\xe2\x9a\xa0 overdue "due) : ("due "due))
+        mark = (status=="done"?"\xe2\x9c\x93 ":"")
+        line = sprintf("  [%s] %s  %s%s%s", id, pl, mark, (duestr!=""?duestr"  ":""), text)
+        key = sprintf("%s\t%d\t%s\t%08d", client, pn, dkey, id)
+        rec[key]=line; clientof[key]=client; n++
+      }
+      END {
+        if (n==0) { print "  (no tasks)"; exit }
+        i=0; for (k in rec) keys[i++]=k
+        for (a=1;a<i;a++){ kk=keys[a]; b=a-1; while(b>=0 && keys[b]>kk){keys[b+1]=keys[b];b--}; keys[b+1]=kk }
+        lastc=""
+        for (a=0;a<i;a++){ k=keys[a]; c=clientof[k]; if(c!=lastc){ if(lastc!="")print""; print c; lastc=c } print rec[k] }
+      }
+    ' "$DB"
+    ;;
+  *)
+    echo "Usage: todo {add <client> <text> [!h|!m|!l] [@YYYY-MM-DD] | list [client] | all | done <id> | rm <id> | clear done}" >&2
+    exit 1
+    ;;
+esac

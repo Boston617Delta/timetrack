@@ -1,0 +1,95 @@
+#!/bin/bash
+# Emits Claude Code hook JSON describing time-tracker state, so Claude sees
+# running timers (and forgotten ones) at the start of a session and as you work.
+# Usage: hook-status session-start | hook-status prompt
+# Reads $TT_DIR/active (one epoch|client|task line per client). Never fails the hook.
+#
+# Optional settings (environment variables):
+#   TT_DIR            data folder (default ~/.timetrack)
+#   TT_TRACK_CMD      how Claude should call the tracker (default ~/.timetrack/bin/track)
+#   TT_STALE_HOURS    flag a timer as probably forgotten after this many hours (default 8)
+#   TT_THROTTLE_MIN   minutes between "no timer running" reminders on prompts (default 20)
+#   TT_IGNORE         comma-separated client codes to leave out of suggestions (e.g. "OLDCO,TEST")
+#   TT_DEFAULT_CLIENT client code for your own internal work, mentioned in the reminder (optional)
+set -u
+
+TT="${TT_DIR:-$HOME/.timetrack}"
+ACTIVE="${TT}/active"
+LOG="${TT}/log.csv"
+STAMP="${TT}/.hook-reminded"
+TRACK="${TT_TRACK_CMD:-~/.timetrack/bin/track}"
+MODE="${1:-session-start}"
+STALE=$(( ${TT_STALE_HOURS:-8} * 3600 ))
+THROTTLE=$(( ${TT_THROTTLE_MIN:-20} * 60 ))
+IGNORE="$(printf '%s' "${TT_IGNORE:-}" | tr '[:lower:]' '[:upper:]')"
+
+now=$(date +%s)
+
+emit() {  # emit <event> <text>
+  EV="$1" TXT="$2" python3 -c '
+import json,os
+print(json.dumps({"hookSpecificOutput":{"hookEventName":os.environ["EV"],"additionalContext":os.environ["TXT"]},"suppressOutput":True}))
+' 2>/dev/null || true
+}
+
+if [ "$MODE" = "session-start" ]; then EVENT="SessionStart"; else EVENT="UserPromptSubmit"; fi
+
+# --- active timers present (one line per client) ---
+if [ -s "$ACTIVE" ]; then
+  running=""; stale=""; n=0
+  while IFS= read -r line; do
+    started=${line%%|*}
+    rest=${line#*|}
+    client=${rest%%|*}
+    task=${rest#*|}
+    case "$started" in (*[!0-9]*|"") continue;; esac
+    elapsed=$(( now - started ))
+    h=$(( elapsed / 3600 )); m=$(( (elapsed % 3600) / 60 ))
+    n=$(( n + 1 ))
+    running="${running}${running:+; }'${client}' (task: ${task}) ${h}h ${m}m"
+    if [ "$elapsed" -gt "$STALE" ]; then
+      stale="${stale}${stale:+; }'${client}' ${h}h ${m}m"
+    fi
+  done < "$ACTIVE"
+  if [ "$n" -gt 0 ]; then
+    msg="TIME TRACKER: ${n} timer(s) ACTIVE, one per client allowed: ${running}. Do not start a second timer for a client that already has one; starting a timer for a different client is fine. Stop with ${TRACK} stop <client> (client name is required when more than one is running)."
+    if [ -n "$stale" ]; then
+      msg="${msg} Probably left on by accident (over ${TT_STALE_HOURS:-8}h): ${stale}. Ask the user whether to stop it and at what end time, then close it with ${TRACK} stop <client> --after <3h|90m|1.5h> or --at <HH:MM>, which keeps the real start time and only corrects the end. Do not hand-edit log.csv."
+    fi
+    emit "$EVENT" "$msg"
+    exit 0
+  fi
+fi
+
+# --- no active timer ---
+if [ "$MODE" = "prompt" ]; then
+  if [ -f "$STAMP" ]; then
+    last=$(head -1 "$STAMP" 2>/dev/null)
+    case "$last" in (*[!0-9]*|"") last=0;; esac
+    [ $(( now - last )) -lt "$THROTTLE" ] && exit 0
+  fi
+  echo "$now" > "$STAMP" 2>/dev/null || true
+fi
+
+# Suggest the 12 most-used client codes from the log, skipping TT_IGNORE and
+# folding case variants to their most-used spelling.
+clients=""
+if [ -r "$LOG" ]; then
+  clients=$(awk -F',' -v ignore=",${IGNORE}," '
+    NR>1 && $2!="" {
+      key=toupper($2)
+      if (index(ignore, "," key ",")) next
+      n[key]++
+      cnt[key SUBSEP $2]++
+      if (cnt[key SUBSEP $2] > best[key]) { best[key]=cnt[key SUBSEP $2]; label[key]=$2 }
+    }
+    END { for (k in n) printf "%d %s\n", n[k], label[k] }
+  ' "$LOG" 2>/dev/null | sort -rn | head -12 | awk '{printf "%s%s", (NR>1?" ":""), $2}')
+fi
+
+msg="TIME TRACKER: no timer is running. If this session is client or billable work, start one as soon as the client is clear: ${TRACK} start <client> \"<short task>\" (use that full path; shell aliases are not loaded in Claude's Bash tool)."
+[ -n "$clients" ] && msg="${msg} Most-used client codes: ${clients}."
+[ -n "${TT_DEFAULT_CLIENT:-}" ] && msg="${msg} Use ${TT_DEFAULT_CLIENT} for internal work."
+msg="${msg} Skip it if the session is clearly not work. Stop the timer when wrapping up and say what was logged."
+emit "$EVENT" "$msg"
+exit 0

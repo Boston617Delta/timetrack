@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# track: simple persistent time tracker (start/stop/report)
+# State is one saved line per running client timer, so it survives closed terminals & reboots.
+# Log lives at ~/.timetrack/log.csv  (date,client,start,stop,hours,task)
+set -euo pipefail
+
+TT_DIR="${TT_DIR:-$HOME/.timetrack}"
+ACTIVE="$TT_DIR/active"
+LOG="$TT_DIR/log.csv"
+
+mkdir -p "$TT_DIR"
+[ -f "$LOG" ] || echo "date,client,start_iso,stop_iso,duration_hours,task" > "$LOG"
+
+iso()   { date -r "$1" "+%Y-%m-%d %H:%M:%S"; }          # epoch -> readable (BSD/macOS date)
+human() { local s=$1; printf "%dh %02dm" $(( s/3600 )) $(( (s%3600)/60 )); }
+
+# "3h" | "90m" | "1.5h" | "2h30m" | "45s" | "3" (bare number = hours) -> seconds; empty if unparseable
+parse_duration() {
+  awk -v s="$1" 'BEGIN{
+    str=tolower(s); total=0; matched=0
+    if (str ~ /^[0-9]+(\.[0-9]+)?$/) { total=str*3600; matched=1 }
+    else {
+      tmp=str
+      while (match(tmp, /^[0-9]+(\.[0-9]+)?[hms]/)) {
+        piece=substr(tmp,1,RLENGTH); unit=substr(piece,RLENGTH,1)
+        val=substr(piece,1,RLENGTH-1)+0
+        if (unit=="h") total+=val*3600
+        else if (unit=="m") total+=val*60
+        else total+=val
+        tmp=substr(tmp,RLENGTH+1); matched=1
+      }
+      if (tmp!="") matched=0
+    }
+    if (matched) printf "%d", int(total+0.5)
+  }'
+}
+
+# "HH:MM" / "HH:MM:SS" (assumed on $2, the timer start date) | "YYYY-MM-DD HH:MM[:SS]" | "now"
+# -> epoch; empty if unparseable
+parse_at() {
+  local v day datepart timepart
+  v="$(printf '%s' "$1" | tr 'T' ' ')"
+  day="$2"
+  if [ "$v" = "now" ]; then date +%s; return 0; fi
+  if printf '%s' "$v" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} '; then
+    datepart="${v%% *}"; timepart="${v#* }"
+  else
+    datepart="$day"; timepart="$v"
+  fi
+  printf '%s' "$timepart" | grep -Eq '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$' || return 0
+  timepart="$(printf '%s' "$timepart" | awk -F: '{ if (NF==2) printf "%02d:%02d:00",$1,$2; else printf "%02d:%02d:%02d",$1,$2,$3 }')"
+  date -j -f "%Y-%m-%d %H:%M:%S" "$datepart $timepart" +%s 2>/dev/null || true
+}
+
+cmd="${1:-status}"; shift || true
+
+# ACTIVE holds one line per running timer: epoch|client|task. One timer per client.
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+active_lines() { [ -f "$ACTIVE" ] && grep -E '^[0-9]+\|' "$ACTIVE" || true; }
+active_count() { active_lines | grep -c . || true; }
+find_active() {  # find_active <client> -> matching line (case-insensitive)
+  local want; want="$(lc "$1")"
+  active_lines | awk -F'|' -v w="$want" 'tolower($2)==w { print; exit }'
+}
+remove_active() {  # remove_active <client>
+  local want tmp; want="$(lc "$1")"; tmp="$ACTIVE.tmp.$$"
+  active_lines | awk -F'|' -v w="$want" 'tolower($2)!=w' > "$tmp"
+  if [ -s "$tmp" ]; then mv "$tmp" "$ACTIVE"; else rm -f "$tmp" "$ACTIVE"; fi
+}
+list_active() {
+  local now; now=$(date +%s)
+  active_lines | while IFS='|' read -r e c t; do
+    echo "▶️  $c${t:+: $t} running for $(human $(( now - e ))) (since $(iso "$e"))"
+  done
+}
+pick_active() {  # pick_active <client-or-empty> <verb> -> sets SEL line or exits
+  local n
+  if [ -n "$1" ]; then
+    SEL="$(find_active "$1")"
+    [ -n "$SEL" ] || { echo "No timer running for '$1'." >&2; list_active >&2; exit 1; }
+  else
+    n="$(active_count)"
+    [ "$n" -gt 0 ] || { echo "Nothing is being tracked." >&2; exit 1; }
+    if [ "$n" -gt 1 ]; then
+      echo "$n timers are running. Say which client: track $2 <client>" >&2; list_active >&2; exit 1
+    fi
+    SEL="$(active_lines | head -1)"
+  fi
+}
+
+case "$cmd" in
+  start)
+    client="${1:-}"
+    [ -n "$client" ] || { echo "Usage: track start <client> [task...]" >&2; exit 1; }
+    existing="$(find_active "$client")"
+    if [ -n "$existing" ]; then
+      IFS='|' read -r e c t <<< "$existing"
+      echo "⏳ Already tracking '$c'${t:+: $t} since $(iso "$e"). Run 'track stop $c' first." >&2
+      exit 1
+    fi
+    shift || true
+    task="$*"; task="${task//,/;}"; task="${task//|/;}"   # keep CSV + state file clean
+    now=$(date +%s)
+    printf '%s|%s|%s\n' "$now" "$client" "$task" >> "$ACTIVE"
+    echo "▶️  Started $client${task:+: $task} at $(iso "$now")"
+    others=$(( $(active_count) - 1 ))
+    [ "$others" -gt 0 ] && echo "   ($others other client timer(s) also running)"
+    ;;
+  backfill)
+    # Reconstruct a completed interval without altering any active timer.
+    client="${1:-}"; task="${2:-}"
+    [ -n "$client" ] && [ -n "$task" ] || { echo 'Usage: track backfill <client> "<task>" --from "YYYY-MM-DD HH:MM:SS" --to "YYYY-MM-DD HH:MM:SS"' >&2; exit 1; }
+    shift 2
+    from_val=""; to_val=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --from) [ $# -ge 2 ] || exit 1; from_val="$2"; shift 2 ;;
+        --to) [ $# -ge 2 ] || exit 1; to_val="$2"; shift 2 ;;
+        *) echo "Unknown backfill option: $1" >&2; exit 1 ;;
+      esac
+    done
+    for value in "$from_val" "$to_val"; do
+      printf '%s' "$value" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$' || { echo 'Backfill requires a full date and time for --from and --to.' >&2; exit 1; }
+    done
+    case "$client$task" in
+      *$'\n'*|*$'\r'*) echo 'Client and task must be single-line values.' >&2; exit 1 ;;
+    esac
+    case "$client" in
+      *','*|*'|'*) echo 'Client must not contain commas or pipes.' >&2; exit 1 ;;
+    esac
+    start="$(parse_at "$from_val" "")"
+    stop_epoch="$(parse_at "$to_val" "")"
+    [ -n "$start" ] && [ -n "$stop_epoch" ] || { echo 'Invalid backfill date/time.' >&2; exit 1; }
+    [ "$stop_epoch" -gt "$start" ] || { echo 'Backfill stop must be after start.' >&2; exit 1; }
+    [ "$stop_epoch" -le "$(date +%s)" ] || { echo 'Backfill stop cannot be in the future.' >&2; exit 1; }
+    existing="$(find_active "$client")"
+    [ -z "$existing" ] || { echo "A timer is active for $client; close it before backfilling." >&2; exit 1; }
+    start_iso="$(iso "$start")"; stop_iso="$(iso "$stop_epoch")"
+    if awk -F, -v c="$(lc "$client")" -v s="$start_iso" -v e="$stop_iso" '
+      NR>1 && tolower($2)==c && ("x" $3 < "x" e) && ("x" $4 > "x" s) { found=1 }
+      END { exit !found }
+    ' "$LOG"; then
+      echo "Backfill overlaps an existing $client entry. Nothing logged." >&2; exit 1
+    fi
+    task="${task//,/;}"; task="${task//|/;}"
+    secs=$(( stop_epoch - start ))
+    hours=$(awk "BEGIN{printf \"%.2f\", $secs/3600}")
+    printf '%s,%s,%s,%s,%s,%s\n' "$(date -r "$start" '+%Y-%m-%d')" "$client" "$start_iso" "$stop_iso" "$hours" "$task" >> "$LOG"
+    echo "Backfilled $client: $start_iso to $stop_iso (${hours}h)."
+    ;;
+  stop)
+    at_val=""; after_val=""; want=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --at)      [ $# -ge 2 ] || { echo "--at needs a value (e.g. --at 11:54)" >&2; exit 1; }; at_val="$2"; shift 2 ;;
+        --at=*)    at_val="${1#--at=}"; shift ;;
+        --after)   [ $# -ge 2 ] || { echo "--after needs a value (e.g. --after 3h)" >&2; exit 1; }; after_val="$2"; shift 2 ;;
+        --after=*) after_val="${1#--after=}"; shift ;;
+        -h|--help)
+          echo "Usage: track stop [client] [--at <HH:MM | 'YYYY-MM-DD HH:MM' | now>] [--after <3h|90m|1.5h|2h30m>]"
+          echo "  client   required when more than one client timer is running"
+          echo "  --at     close the timer at a specific clock time (bare HH:MM = the day the timer started)"
+          echo "  --after  close it a fixed span after the start, for timers left running"
+          exit 0 ;;
+        -*) echo "Unknown option for stop: $1" >&2; exit 1 ;;
+        *)  [ -z "$want" ] || { echo "Stop one client at a time." >&2; exit 1; }; want="$1"; shift ;;
+      esac
+    done
+    pick_active "$want" stop
+    IFS='|' read -r start client task <<< "$SEL"
+    if [ -n "$at_val" ] && [ -n "$after_val" ]; then
+      echo "Use --at or --after, not both." >&2; exit 1
+    fi
+    now=$(date +%s)
+    if [ -n "$after_val" ]; then
+      add="$(parse_duration "$after_val")"
+      [ -n "$add" ] || { echo "Could not read duration '$after_val'. Try 3h, 90m, 1.5h or 2h30m." >&2; exit 1; }
+      stop_epoch=$(( start + add ))
+    elif [ -n "$at_val" ]; then
+      stop_epoch="$(parse_at "$at_val" "$(date -r "$start" "+%Y-%m-%d")")"
+      [ -n "$stop_epoch" ] || { echo "Could not read time '$at_val'. Try 11:54, '2026-09-19 11:54' or now." >&2; exit 1; }
+    else
+      stop_epoch="$now"
+    fi
+    if [ "$stop_epoch" -lt "$start" ]; then
+      echo "Stop time $(iso "$stop_epoch") is before the start $(iso "$start"). Nothing logged." >&2; exit 1
+    fi
+    if [ "$stop_epoch" -gt "$now" ]; then
+      echo "Stop time $(iso "$stop_epoch") is in the future. Nothing logged." >&2; exit 1
+    fi
+    secs=$(( stop_epoch - start ))
+    hours=$(awk "BEGIN{printf \"%.2f\", $secs/3600}")
+    printf '%s,%s,%s,%s,%s,%s\n' "$(date -r "$start" "+%Y-%m-%d")" "$client" "$(iso "$start")" "$(iso "$stop_epoch")" "$hours" "$task" >> "$LOG"
+    remove_active "$client"
+    if [ "$stop_epoch" -ne "$now" ]; then
+      echo "⏹  Stopped $client${task:+: $task}: $(human "$secs") (${hours}h) logged, closed at $(iso "$stop_epoch") instead of now (real elapsed $(human $(( now - start ))))."
+    else
+      echo "⏹  Stopped $client${task:+: $task}: $(human "$secs") (${hours}h) logged."
+    fi
+    ;;
+  status)
+    [ "$(active_count)" -gt 0 ] || { echo "No active timer."; exit 0; }
+    list_active
+    ;;
+  cancel)
+    [ "$(active_count)" -gt 0 ] || { echo "No active timer to cancel."; exit 0; }
+    pick_active "${1:-}" cancel
+    IFS='|' read -r start client task <<< "$SEL"
+    remove_active "$client"
+    echo "🗑  Cancelled $client${task:+: $task} (not logged)."
+    ;;
+  report)
+    arg="${1:-}"; since=""; cf=""
+    case "$arg" in
+      today) since=$(date "+%Y-%m-%d") ;;
+      week)  since=$(date -v-6d "+%Y-%m-%d") ;;
+      month) since=$(date "+%Y-%m-01") ;;
+      "")    : ;;
+      *)     cf="$arg" ;;
+    esac
+    label="${arg:-all time}"
+    echo "Hours: ${label}:"
+    awk -F, -v since="$since" -v cf="$cf" '
+      NR==1 { next }
+      { d=$1; client=$2; h=$5+0
+        if (since != "" && d < since) next
+        if (cf != "" && client != cf) next
+        tot[client]+=h; grand+=h; n++ }
+      END {
+        if (n==0) { print "  (no entries)"; exit }
+        for (c in tot) printf "  %-26s %7.2f h\n", c, tot[c]
+        printf "  %-26s %7.2f h\n", "TOTAL", grand }
+    ' "$LOG"
+    ;;
+  log)
+    tail -n "${1:-10}" "$LOG"
+    ;;
+  *)
+    echo "Usage: track {start <client> [task] | stop [client] [--at <time>|--after <dur>] | status | cancel [client] | report [client|today|week|month] | log [n] | backfill <client> <task> --from <date-time> --to <date-time>}" >&2
+    exit 1
+    ;;
+esac

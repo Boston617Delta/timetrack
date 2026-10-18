@@ -1,0 +1,7 @@
+log.csv
+active
+todos.tsv
+.hook-reminded
+*.bak*
+*.tmp*
+.DS_Store
