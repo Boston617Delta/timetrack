@@ -1,20 +1,20 @@
 # timetrack
 
-A small per-client time tracker for people who bill by the hour, plus a to-do list and optional Claude Code hooks. It is plain Bash and a CSV file. There is no app, no account, and no background process: `start` saves a timestamp, `stop` writes a row.
+A small per-client time tracker for people who bill by the hour, with a to-do list and optional Claude Code hooks. It's a few Bash scripts that write to a CSV file on your computer: `start` saves a timestamp and `stop` writes a row.
 
-I built it for my one-person marketing agency, where several client projects run in parallel and the expensive mistake is not a missing timer but a timer left running overnight.
+I built it for my one-person marketing agency. I usually have several client projects going at once, so I needed a way to keep the timers separate and to catch one I'd forgotten to stop.
 
 ## What it does
 
 - **One timer per client.** Several clients can run at once, but the same client cannot have two timers, so hours are not double-counted.
 - **Survives restarts.** Running timers live in a text file, so closing the terminal or rebooting does not lose them.
-- **Fixes forgotten timers honestly.** `stop --after 3h` or `stop --at 16:30` closes a timer that ran too long. The real start time is kept and only the end is corrected.
+- **Fixes forgotten timers.** `stop --after 3h` or `stop --at 16:30` closes a timer that ran too long. The real start time is kept and only the end is corrected.
 - **Refuses impossible entries.** A stop time before the start or in the future is rejected and the timer stays running.
 - **Backfills missed sessions** without touching running timers, and refuses entries that overlap existing ones for the same client.
 - **Reports** hours by client for today, the last 7 days, this month, or all time.
 - **With Claude Code (optional):** a hook tells Claude which timers are running when a session starts and as you work, flags any timer running longer than 8 hours as probably forgotten, and reminds Claude to start a timer when client work begins. A `/timer` slash command starts and stops timers in chat.
 
-What it does **not** do: decide what is billable. It gives you a clean record; checking that record against the work and your client agreement is still your job.
+It doesn't decide what's billable. It gives you a clean record, and you still check that record against the work and your client agreement.
 
 ## Requirements
 
