@@ -2,7 +2,7 @@
 
 A small per-client time tracker for people who bill by the hour, with a to-do list and optional Claude Code hooks. It's a few Bash scripts that write to a CSV file on your computer: `start` saves a timestamp and `stop` writes a row.
 
-I built it for my one-person marketing agency. I usually have several client projects going at once, so I needed a way to keep the timers separate and to catch one I'd forgotten to stop.
+I built it for my one-person marketing agency. It works best for freelancers and solo agency owners who bill several clients by the hour and have more than one project going at a time, because it keeps each client's timer separate and catches one you forgot to stop.
 
 ## What it does
 
